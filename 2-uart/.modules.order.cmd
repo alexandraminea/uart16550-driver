@@ -1,0 +1,1 @@
+cmd_/home/alexandra/ANUL4/SO2/linux/tools/labs/skels/./assignments/2-uart/modules.order := {   echo /home/alexandra/ANUL4/SO2/linux/tools/labs/skels/./assignments/2-uart/uart16550.ko; :; } | awk '!x[$$0]++' - > /home/alexandra/ANUL4/SO2/linux/tools/labs/skels/./assignments/2-uart/modules.order
