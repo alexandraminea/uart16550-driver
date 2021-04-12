@@ -47,7 +47,10 @@ irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
 static int uart_cdev_open(struct inode *inode, struct file *file)
 {       
     int current_minor;
+    struct com_device_data *data = container_of(inode->i_cdev, struct com_device_data, cdev);
     current_minor = iminor(inode);
+
+	file->private_data = data;
     return 0;
 }
 
@@ -69,9 +72,37 @@ uart_cdev_write(struct file *file, const char __user *user_buffer,
     return size;
 }
 
+static int check_ioctl_data(struct uart16550_line_info* data)
+{
+    /* check baud rate */
+    if (data->baud != UART16550_BAUD_1200 || data->len != UART16550_BAUD_2400 
+        || data->len != UART16550_BAUD_4800 || data->len != UART16550_BAUD_9600
+        || data->len != UART16550_BAUD_19200 || data->len != UART16550_BAUD_38400
+        || data->len != UART16550_BAUD_56000 || data->len != UART16550_BAUD_115200)
+        return -1;
+
+    /* check len */
+    if (data->len != 0b00 || data->len != 0b01 
+        || data->len != 0b10 || data->len != 0b11)
+        return -1;
+    return 0;
+}
+
 static long
 uart_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    struct com_device_data* dev = (struct com_device_data*) file->private_data;
+    struct uart16550_line_info *line_info = (struct uart16550_line_info*) arg;
+
+
+    /* wrong operation */
+    if (cmd != UART16550_IOCTL_SET_LINE) {
+        return -EINVAL;
+    }
+
+    if (check_ioctl_data(line_info) < 0)
+        return -EINVAL;
+
     return 0;
 }
 
@@ -86,24 +117,22 @@ static const struct file_operations cdev_fops = {
 
 static int get_reg(int minor)
 {
-    int start;
-    if (minor == 0)
-        start = COM1_REG;
-    else
-        start = COM2_REG;
-    return start;
+    switch (minor) {
+    case 0:
+        return COM1_REG;
+    default:
+        return COM2_REG;
+    }
 }
 
 static int get_irq(int minor)
 {
-    int irq;
-    if (minor == 0) {
-        irq = COM1_IRQ;
+    switch (minor) {
+    case 0:
+        return COM1_IRQ;
+    default:
+        return COM2_IRQ;
     }
-    else {
-        irq = COM2_IRQ;
-    }
-    return irq;
 }
 
 static int init_com_device(int major, int minor)
@@ -210,8 +239,8 @@ static void uart16550_exit(void)
         delete_com_device(major, 0);
         delete_com_device(major, 1);
         break;
-    default:
-        return;
+    // default:
+    //     return;
     }
     //class_unregister(chardev_class);
     class_destroy(chardev_class);
@@ -222,3 +251,4 @@ module_param(option, int, S_IRUGO);
 
 module_init(uart16550_init);
 module_exit(uart16550_exit);
+
