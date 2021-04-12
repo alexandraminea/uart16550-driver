@@ -1,26 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0+
-
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
+#include <asm/io.h>
 #include <linux/uaccess.h>
-#include <linux/sched.h>
-#include <linux/wait.h>
-#include <linux/device.h>
-#include <linux/kdev_t.h>
-#include <linux/miscdevice.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/kprobes.h>
-#include <linux/list.h>
-#include <linux/sched/signal.h>
-#include <linux/slab.h>
-#include <linux/kallsyms.h>
+#include <linux/ioport.h>
+#include <linux/interrupt.h>
 #include <linux/spinlock.h>
-#include <linux/delay.h>
-#include <linux/spinlock.h>
+
 
 #include "uart16550.h"
 
@@ -31,8 +20,11 @@ MODULE_LICENSE("GPL");
 #define MY_MAJOR		42
 #define MODULE_NAME		"uart16550"
 #define NUM_MINORS      2
-#define COM1_START				0x3f8
-#define COM2_START				0x2f8
+#define COM1_REG		0x3f8
+#define COM2_REG		0x2f8
+#define NR_PORTS		8
+#define COM1_IRQ		4
+#define COM2_IRQ        3
 
 static int major = 42;
 static int option = OPTION_BOTH;
@@ -46,6 +38,10 @@ struct com_device_data {
 /* COM1 and COM2 */
 struct com_device_data devs[NUM_MINORS];
 
+irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
+{
+	return IRQ_NONE;
+}
 
 /* chardev functions */
 static int uart_cdev_open(struct inode *inode, struct file *file)
@@ -88,18 +84,36 @@ static const struct file_operations cdev_fops = {
 	.unlocked_ioctl = uart_cdev_ioctl,
 };
 
+static int get_reg(int minor)
+{
+    int start;
+    if (minor == 0)
+        start = COM1_REG;
+    else
+        start = COM2_REG;
+    return start;
+}
+
+static int get_irq(int minor)
+{
+    int irq;
+    if (minor == 0) {
+        irq = COM1_IRQ;
+    }
+    else {
+        irq = COM2_IRQ;
+    }
+    return irq;
+}
+
 static int init_com_device(int major, int minor)
 {
     int err;
     struct device *dev;
-    int start;
+    int start, irq;
 
-    /* get the baseport */
-    if (minor == 0)
-        start = COM1_START;
-    else
-        start = COM2_START;
-
+    start = get_reg(minor);
+    irq = get_irq(minor);
 
     /* register chardev region */
     err = register_chrdev_region(MKDEV(major, minor), 1, MODULE_NAME);
@@ -114,20 +128,27 @@ static int init_com_device(int major, int minor)
         goto unregister_chrdev_region;
     }
 
-    // if (!request_region(start, NR_PORTS, MODULE_NAME)) {
-    //     err = -ENODEV;
-    //     goto device_destroy;
-    // }
+    /* request the I/O ports */
+    if (request_region(start, NR_PORTS, MODULE_NAME) == NULL) {
+		err = -EBUSY;
+		goto device_destroy;
+	}
 
-    // IO ports
-
-    // INTERRUPTS
+    /* register IRQ handler */
+    err = request_irq(irq, uart16550_interrupt_handle,
+			IRQF_SHARED, MODULE_NAME, &devs[minor]);
+	if (err != 0) {
+		pr_err("request_irq failed: %d\n", err);
+		goto release_region;
+	}
 
     cdev_init(&devs[minor].cdev, &cdev_fops);
     cdev_add(&devs[minor].cdev, MKDEV(major, minor), 1);
 
     return 0;
 
+release_region:
+    release_region(start, NR_PORTS);
 device_destroy:
     device_destroy(chardev_class, MKDEV(major, minor));
 unregister_chrdev_region:
@@ -138,8 +159,16 @@ unregister_chrdev_region:
 
 static int delete_com_device(int major, int minor)
 {
-    device_destroy(chardev_class, MKDEV(major, minor));
+    int start, irq;
 
+    start = get_reg(minor);
+    irq = get_irq(minor);
+
+    release_region(start, NR_PORTS);
+
+    free_irq(irq, &devs[minor]);
+
+    device_destroy(chardev_class, MKDEV(major, minor));
     unregister_chrdev_region(MKDEV(major, minor), 1);
 
     cdev_del(&devs[minor].cdev);
