@@ -66,11 +66,13 @@ struct com_device_data {
     /* spinlock for kfifo read buffer */
     spinlock_t read_lock;
 
-    /* kfifo read buffer */
+    /* kfifo buffers */
     DECLARE_KFIFO(read_buffer, unsigned char, BUFFER_SIZE);
+    DECLARE_KFIFO(write_buffer, unsigned char, BUFFER_SIZE);
 
-    /* wait queue for read operation */
-    wait_queue_head_t read_wait_queue;
+    /* wait queues */
+    wait_queue_head_t wq_read;
+    wait_queue_head_t wq_write;
 
     struct cdev cdev;
 };
@@ -138,6 +140,7 @@ irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
     minor = get_minor(irq_no);
     port = get_reg(minor);
 
+    /* READ */
     while (check_data_ready(port)) {
 
         /* read character from RBR register */
@@ -147,7 +150,11 @@ irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
         kfifo_put(&devs[minor].read_buffer, ch);
     }
 
-    wake_up_interruptible(&devs[minor].read_wait_queue);
+    wake_up_interruptible(&devs[minor].wq_read);
+
+    /* WRITE */
+
+
 
 	return IRQ_NONE;
 }
@@ -180,7 +187,7 @@ uart16550_cdev_read(struct file *file, char __user *user_buffer,
         return -ENOMEM;
 
     /* block until data available */
-    wait_event_interruptible(dev->read_wait_queue, 
+    wait_event_interruptible(dev->wq_read, 
                                 !kfifo_is_empty(&dev->read_buffer));
 
     /* read data from read_buffer */
@@ -190,7 +197,7 @@ uart16550_cdev_read(struct file *file, char __user *user_buffer,
     copy_to_user(user_buffer, buffer, size);
 
     /* signal data read done */
-    wake_up_interruptible(&dev->read_wait_queue);
+    wake_up_interruptible(&dev->wq_read);
 
     kfree(buffer);
 
@@ -345,8 +352,11 @@ static int init_com_device(int major, int minor)
     spin_lock_init(&devs[minor].read_lock);
 
     INIT_KFIFO(devs[minor].read_buffer);
+    INIT_KFIFO(devs[minor].write_buffer);
 
-    init_waitqueue_head(&devs[minor].read_wait_queue);
+
+    init_waitqueue_head(&devs[minor].wq_read);
+    init_waitqueue_head(&devs[minor].wq_write);
 
     /* register chardev region */
     err = register_chrdev_region(MKDEV(major, minor), 1, MODULE_NAME);
