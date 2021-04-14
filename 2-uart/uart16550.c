@@ -63,12 +63,13 @@ static struct class *chardev_class = NULL;
 struct com_device_data {
     int port;
 
-    /* spinlock for kfifo read buffer */
-    spinlock_t read_lock;
-
     /* kfifo buffers */
     DECLARE_KFIFO(read_buffer, unsigned char, BUFFER_SIZE);
     DECLARE_KFIFO(write_buffer, unsigned char, BUFFER_SIZE);
+
+    /* spinlock for kfifo read buffer */
+    spinlock_t read_lock;
+    spinlock_t write_lock;
 
     /* wait queues */
     wait_queue_head_t wq_read;
@@ -113,6 +114,7 @@ static int get_minor(int irq)
     }
 }
 
+/* interrupt read helpers */
 static inline int get_interrupt_type(int port)
 {
     return inb(port + IIR_OFFSET);
@@ -132,6 +134,31 @@ static inline u_char uart16550_read_data(int port)
     return inb(port + RBR_OFFSET);
 }
 
+/* interrupt write helpers */
+static inline u_char check_THRE(int port)
+{
+    get_interrupt_type(port);
+
+    /* check bit 0 of LSR register(data ready) */
+    return inb(port + LSR_OFFSET) & BIT_6;
+}
+
+static inline void uart16550_write_data(int port, u_char ch)
+{
+    /* THR register */
+    outb(ch, port + THR_OFFSET);
+}
+
+static inline void clear_interrupts(int port)
+{
+    u_char mask = 0;
+
+    outb(mask, port + IER_OFFSET);
+    mask |= BIT_0 | BIT_1;
+
+    outb(mask, port + IER_OFFSET);
+}
+
 irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
 {
     int port, minor;
@@ -147,16 +174,26 @@ irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
         ch = uart16550_read_data(port);
 
         /* put character in read buffer */
-        kfifo_put(&devs[minor].read_buffer, ch);
+        if(kfifo_put(&devs[minor].read_buffer, ch) != 0)
+            break;
     }
 
     wake_up_interruptible(&devs[minor].wq_read);
 
-    /* WRITE */
+    // /* WRITE */
+    while (check_THRE(port)) {
 
+        /* read character from write buffer */
+        if(kfifo_get(&devs[minor].write_buffer, &ch) == 0)
+            break;
+        
+        /* put character in THR register*/
+        uart16550_write_data(port, ch);
+    }
+    
+    wake_up_interruptible(&devs[minor].wq_write);
 
-
-	return IRQ_NONE;
+	return IRQ_HANDLED;
 }
 
 /* -------------- CHAR DEVICE FUNCTIONS -------------- */
@@ -181,25 +218,31 @@ uart16550_cdev_read(struct file *file, char __user *user_buffer,
 {
     unsigned char* buffer;
     struct com_device_data *dev = (struct com_device_data*) file->private_data;
+    int port = dev->port;
+    int read;
 
     buffer = kmalloc(sizeof(*buffer), GFP_KERNEL);
     if (buffer == NULL)
         return -ENOMEM;
 
+
     /* block until data available */
     wait_event_interruptible(dev->wq_read, 
-                                !kfifo_is_empty(&dev->read_buffer));
+                            !kfifo_is_empty(&dev->read_buffer));
 
-    /* read data from read_buffer */
+    /* write data to local buffer */
     size = kfifo_out(&dev->read_buffer, buffer, size);
 
-    /* copy to user */
+    /* copy to user buffer s*/
     copy_to_user(user_buffer, buffer, size);
+
+    kfree(buffer);
 
     /* signal data read done */
     wake_up_interruptible(&dev->wq_read);
 
-    kfree(buffer);
+    /* reset interrupts */
+    clear_interrupts(port);
 
     return size;
 }
@@ -208,7 +251,37 @@ static ssize_t
 uart16550_cdev_write(struct file *file, const char __user *user_buffer,
 		        size_t size, loff_t *offset)
 {
-    return 0;
+    unsigned char* buffer;
+    struct com_device_data *dev = (struct com_device_data*) file->private_data;
+    int port = dev->port;
+
+    buffer = kmalloc(sizeof(*buffer), GFP_KERNEL);
+    if (buffer == NULL)
+        return -ENOMEM;
+
+    /* copy user buffer */
+    if(copy_from_user(buffer, user_buffer, size) != 0)
+    {
+        kfree(buffer);
+        return -EFAULT;
+    }
+
+    /* block until something was read */
+    wait_event_interruptible(dev->wq_write, 
+                            !kfifo_is_full(&dev->write_buffer));
+
+    /* read from write buffer */
+    size = kfifo_in(&dev->write_buffer, buffer, size);
+
+    kfree(buffer);
+
+    /* signal data write */
+    wake_up_interruptible(&dev->wq_write);
+
+    /* reset interrupts */
+    clear_interrupts(port);
+
+    return size;
 }
 
 static int check_ioctl_data(struct uart16550_line_info* data)
@@ -350,6 +423,7 @@ static int init_com_device(int major, int minor)
     devs[minor].port = start;
 
     spin_lock_init(&devs[minor].read_lock);
+    spin_lock_init(&devs[minor].write_lock);
 
     INIT_KFIFO(devs[minor].read_buffer);
     INIT_KFIFO(devs[minor].write_buffer);
@@ -465,5 +539,4 @@ module_param(option, int, S_IRUGO);
 
 module_init(uart16550_init);
 module_exit(uart16550_exit);
-
 
