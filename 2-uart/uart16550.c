@@ -12,11 +12,12 @@
 #include <linux/kfifo.h>
 #include <linux/wait.h>
 #include <linux/slab.h>
+#include <linux/mutex.h>
 
 #include "uart16550.h"
 
-MODULE_DESCRIPTION("uart 16550 driver");
-MODULE_AUTHOR("Minea Alexandra");
+MODULE_DESCRIPTION("uart16550 driver");
+MODULE_AUTHOR("Minea Alexandra + Pauca Dragos");
 MODULE_LICENSE("GPL");
 
 
@@ -44,7 +45,6 @@ MODULE_LICENSE("GPL");
 
 /* register offsets */
 #define LCR_OFFSET      3
-#define FCR_OFFSET      2
 #define LSR_OFFSET      5
 #define RBR_OFFSET      0
 #define THR_OFFSET      0
@@ -61,15 +61,15 @@ static int option = OPTION_BOTH;
 
 static struct class *chardev_class = NULL;
 struct com_device_data {
-    int port;
+    int base;
 
     /* kfifo buffers */
     DECLARE_KFIFO(read_buffer, unsigned char, BUFFER_SIZE);
     DECLARE_KFIFO(write_buffer, unsigned char, BUFFER_SIZE);
 
-    /* spinlock for kfifo read buffer */
-    spinlock_t read_lock;
-    spinlock_t write_lock;
+    /* mutex for kfifo */
+    struct mutex read_lock;
+    struct mutex write_lock;
 
     /* wait queues */
     wait_queue_head_t wq_read;
@@ -80,7 +80,6 @@ struct com_device_data {
 
 /* COM1 and COM2 */
 struct com_device_data devs[NUM_MINORS];
-
 
 /* -------------- INTERRUPT FUNCTIONS -------------- */
 
@@ -115,63 +114,65 @@ static int get_minor(int irq)
 }
 
 /* interrupt read helpers */
-static inline int get_interrupt_type(int port)
+static inline int get_interrupt_type(int base)
 {
-    return inb(port + IIR_OFFSET);
+    return inb(base + IIR_OFFSET);
 }
 
-static inline u_char check_data_ready(int port)
+static inline u_char check_data_ready(int base)
 {
-    get_interrupt_type(port);
+    get_interrupt_type(base);
 
     /* check bit 0 of LSR register(data ready) */
-    return inb(port + LSR_OFFSET) & BIT_0;
+    return inb(base + LSR_OFFSET) & BIT_0;
 }
 
-static inline u_char uart16550_read_data(int port)
+static inline u_char uart16550_read_data(int base)
 {
     /* RBR register */
-    return inb(port + RBR_OFFSET);
+    return inb(base + RBR_OFFSET);
 }
 
 /* interrupt write helpers */
-static inline u_char check_THRE(int port)
+static inline u_char check_THRE(int base)
 {
-    get_interrupt_type(port);
+    get_interrupt_type(base);
 
     /* check bit 0 of LSR register(data ready) */
-    return inb(port + LSR_OFFSET) & BIT_6;
+    return inb(base + LSR_OFFSET) & BIT_6;
 }
 
-static inline void uart16550_write_data(int port, u_char ch)
+static inline void uart16550_write_data(int base, u_char ch)
 {
     /* THR register */
-    outb(ch, port + THR_OFFSET);
+    outb(ch, base + THR_OFFSET);
 }
 
-static inline void clear_interrupts(int port)
+static inline void reset_interrupts(int base)
 {
     u_char mask = 0;
 
-    outb(mask, port + IER_OFFSET);
-    mask |= BIT_0 | BIT_1;
+    /* clear interrupts */
+    outb(mask, base + IER_OFFSET);
 
-    outb(mask, port + IER_OFFSET);
+    /* reset interrupts */
+    mask |= BIT_0 | BIT_1;
+    outb(mask, base + IER_OFFSET);
 }
 
 irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
 {
-    int port, minor;
+    int base, minor;
     u_char ch;
 
     minor = get_minor(irq_no);
-    port = get_reg(minor);
+    base = get_reg(minor);
 
     /* READ */
-    while (check_data_ready(port)) {
+    while (check_data_ready(base)) {
 
         /* read character from RBR register */
-        ch = uart16550_read_data(port);
+        ch = uart16550_read_data(base);
 
         /* put character in read buffer */
         if(kfifo_put(&devs[minor].read_buffer, ch) != 0)
@@ -180,30 +181,30 @@ irqreturn_t uart16550_interrupt_handle(int irq_no, void *dev_id)
 
     wake_up_interruptible(&devs[minor].wq_read);
 
-    // /* WRITE */
-    while (check_THRE(port)) {
+    /* WRITE */
+    while (check_THRE(base)) {
 
         /* read character from write buffer */
         if(kfifo_get(&devs[minor].write_buffer, &ch) == 0)
             break;
         
         /* put character in THR register*/
-        uart16550_write_data(port, ch);
+        uart16550_write_data(base, ch);
     }
     
     wake_up_interruptible(&devs[minor].wq_write);
 
-	return IRQ_HANDLED;
+	return IRQ_NONE;
 }
 
 /* -------------- CHAR DEVICE FUNCTIONS -------------- */
 
 static int uart16550_cdev_open(struct inode *inode, struct file *file)
 {       
-    int current_minor;
-    current_minor = iminor(inode);
+    int minor;
+    minor = iminor(inode);
 
-	file->private_data = (void *) &devs[current_minor];
+	file->private_data = (void *) &devs[minor];
     return 0;
 }
 
@@ -216,70 +217,56 @@ static ssize_t
 uart16550_cdev_read(struct file *file, char __user *user_buffer,
 		size_t size, loff_t *offset)
 {
-    unsigned char* buffer;
     struct com_device_data *dev = (struct com_device_data*) file->private_data;
-    int port = dev->port;
-    int read;
+    int base = dev->base;
+    int ret, copied;
 
-    buffer = kmalloc(sizeof(*buffer), GFP_KERNEL);
-    if (buffer == NULL)
-        return -ENOMEM;
-
+    if (mutex_lock_interruptible(&dev->read_lock))
+		return -ERESTARTSYS;
 
     /* block until data available */
     wait_event_interruptible(dev->wq_read, 
                             !kfifo_is_empty(&dev->read_buffer));
 
-    /* write data to local buffer */
-    size = kfifo_out(&dev->read_buffer, buffer, size);
+    /* read data from kfifo and put it in user buffer */
+    ret = kfifo_to_user(&dev->read_buffer, user_buffer, size, &copied);
 
-    /* copy to user buffer s*/
-    copy_to_user(user_buffer, buffer, size);
-
-    kfree(buffer);
+    mutex_unlock(&dev->read_lock);
 
     /* signal data read done */
     wake_up_interruptible(&dev->wq_read);
 
     /* reset interrupts */
-    clear_interrupts(port);
+    reset_interrupts(base);
 
-    return size;
+    return ret ? ret : copied;
 }
 
 static ssize_t
 uart16550_cdev_write(struct file *file, const char __user *user_buffer,
 		        size_t size, loff_t *offset)
 {
-    unsigned char* buffer;
     struct com_device_data *dev = (struct com_device_data*) file->private_data;
-    int port = dev->port;
+    int base = dev->base;
+    int copied, ret;
 
-    buffer = kmalloc(sizeof(*buffer), GFP_KERNEL);
-    if (buffer == NULL)
-        return -ENOMEM;
-
-    /* copy user buffer */
-    if(copy_from_user(buffer, user_buffer, size) != 0)
-    {
-        kfree(buffer);
-        return -EFAULT;
-    }
-
+    if (mutex_lock_interruptible(&dev->write_lock))
+		return -ERESTARTSYS;
+    
     /* block until something was read */
     wait_event_interruptible(dev->wq_write, 
                             !kfifo_is_full(&dev->write_buffer));
 
-    /* read from write buffer */
-    size = kfifo_in(&dev->write_buffer, buffer, size);
+    /* write data in kfifo from user_buffer */
+    ret = kfifo_from_user(&dev->write_buffer, user_buffer, size, &copied);
 
-    kfree(buffer);
+    mutex_unlock(&dev->write_lock);
 
     /* signal data write */
     wake_up_interruptible(&dev->wq_write);
 
     /* reset interrupts */
-    clear_interrupts(port);
+    reset_interrupts(base);
 
     return size;
 }
@@ -322,19 +309,19 @@ static int check_ioctl_data(struct uart16550_line_info* data)
     return 0;
 }
 
-static inline void set_baud(int port, unsigned char baud)
+static inline void set_baud(int base, unsigned char baud)
 {
     /* Divisor latch (DLL + DLM) registers */
 
     /* set bit 7(DLAB) of LCR reg to access Divisor Latch (DLL + DLM) */
-    SET_BIT(port + LCR_OFFSET, BIT_7);
+    SET_BIT(base + LCR_OFFSET, BIT_7);
 
     /* set the baud rate in Divisor Latch */
-    outb(baud, port + DLL_OFFSET);
-    outb(0, port + DLM_OFFSET);
+    outb(baud, base + DLL_OFFSET);
+    outb(0, base + DLM_OFFSET);
 }
 
-static inline void set_params(int port, u_char len, u_char par, u_char stop)
+static inline void set_params(int base, u_char len, u_char par, u_char stop)
 {
     u_char mask = 0;
 
@@ -346,10 +333,10 @@ static inline void set_params(int port, u_char len, u_char par, u_char stop)
     bit 3 | 4 | 5 = parity */
 
     mask = len | stop | par;
-    outb(mask, port + LCR_OFFSET);
+    outb(mask, base + LCR_OFFSET);
 }
 
-static inline void set_interrupts(int port)
+static inline void set_interrupts(int base)
 {
     u_char mask = 0;
 
@@ -361,7 +348,7 @@ static inline void set_interrupts(int port)
     /* enable Transmitter Holding Register Empty Interrupt */
     mask |= BIT_1;
 
-    outb(mask, port + IER_OFFSET);
+    outb(mask, base + IER_OFFSET);
 }
 
 static long
@@ -370,7 +357,7 @@ uart16550_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     struct com_device_data* dev = (struct com_device_data*) file->private_data;
     struct uart16550_line_info *line_info = (struct uart16550_line_info*) arg;
     struct uart16550_line_info line_copy;
-    int port = dev->port;
+    int base = dev->base;
 
     /* wrong operation */
     if (cmd != UART16550_IOCTL_SET_LINE) {
@@ -389,13 +376,13 @@ uart16550_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
 
     /* set baud rate */
-    set_baud(port, line_info->baud);
+    set_baud(base, line_info->baud);
 
     /* set len, par, stop */
-    set_params(port, line_info->len, line_info->par, line_info->stop);
+    set_params(base, line_info->len, line_info->par, line_info->stop);
 
     /* set interrupts */
-    set_interrupts(port);
+    set_interrupts(base);
 
     return 0;
 }
@@ -420,10 +407,13 @@ static int init_com_device(int major, int minor)
     start = get_reg(minor);
     irq = get_irq(minor);
 
-    devs[minor].port = start;
+    devs[minor].base = start;
 
-    spin_lock_init(&devs[minor].read_lock);
-    spin_lock_init(&devs[minor].write_lock);
+    // spin_lock_init(&devs[minor].read_lock);
+    // spin_lock_init(&devs[minor].write_lock);
+
+    mutex_init(&devs[minor].read_lock);
+    mutex_init(&devs[minor].write_lock);
 
     INIT_KFIFO(devs[minor].read_buffer);
     INIT_KFIFO(devs[minor].write_buffer);
@@ -435,17 +425,18 @@ static int init_com_device(int major, int minor)
     /* register chardev region */
     err = register_chrdev_region(MKDEV(major, minor), 1, MODULE_NAME);
     if (err != 0) {
-		pr_info("register_chrdev_region");
+		pr_info("register_chrdev_region\n");
 		return err;
 	}
 
     /* create /dev/uartX entry */
     dev = device_create(chardev_class, NULL, MKDEV(major, minor), NULL, "uart%d", minor);
     if (IS_ERR(dev)) {
+        pr_info("device_create\n");
         goto unregister_chrdev_region;
     }
 
-    /* request the I/O ports */
+    /* request the I/O bases */
     if (request_region(start, NR_PORTS, MODULE_NAME) == NULL) {
 		err = -EBUSY;
 		goto device_destroy;
@@ -455,7 +446,7 @@ static int init_com_device(int major, int minor)
     err = request_irq(irq, uart16550_interrupt_handle,
 			IRQF_SHARED, MODULE_NAME, &devs[minor]);
 	if (err != 0) {
-		pr_err("request_irq failed: %d\n", err);
+		pr_info("request_irq failed: %d\n", err);
 		goto release_region;
 	}
 
@@ -482,7 +473,6 @@ static int delete_com_device(int major, int minor)
     irq = get_irq(minor);
 
     release_region(start, NR_PORTS);
-
     free_irq(irq, &devs[minor]);
 
     device_destroy(chardev_class, MKDEV(major, minor));
@@ -495,22 +485,25 @@ static int delete_com_device(int major, int minor)
 
 static int uart16550_init(void)
 {
+    int err;
     chardev_class = class_create(THIS_MODULE, MODULE_NAME);
 
     switch(option) {
     case OPTION_COM1:
-        init_com_device(major, 0);
+        err = init_com_device(major, 0);
         break;
     case OPTION_COM2:
-        init_com_device(major, 1);
+        err = init_com_device(major, 1);
         break;
     case OPTION_BOTH:
-        init_com_device(major, 0);
-        init_com_device(major, 1);
+        err = init_com_device(major, 0);
+        err = init_com_device(major, 1);
         break;
     default:
         return -EINVAL;
     }
+    if(err != 0)
+        class_destroy(chardev_class);
     return 0;
 }
 
@@ -527,10 +520,7 @@ static void uart16550_exit(void)
         delete_com_device(major, 0);
         delete_com_device(major, 1);
         break;
-    // default:
-    //     return;
     }
-    //class_unregister(chardev_class);
     class_destroy(chardev_class);
 }
 
